@@ -272,7 +272,7 @@ namespace JSON
     [Table(schema: "dbo", name: "JSONCustomers")]
     public class CustomerRaw
     {
-        [Identifier(MicroLite.Mapping.IdentifierStrategy.Assigned)] // Assigned becasue we are only reading
+        [Identifier(MicroLite.Mapping.IdentifierStrategy.Assigned)] // Assigned because we are only reading
 
         [Column("JSONData")]
         public string Data { get; set; }
