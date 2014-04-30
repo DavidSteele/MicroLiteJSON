@@ -1,0 +1,300 @@
+
+My company supplies an application which is subject to annual legislative changes. We cannot predict all the changes so our database structure changes periodically. The application automatically runs scripts to amend table schema and stored procedures, but some DBAs understandably block this. Users are warned but often plough on regardless, causing the application to fail - we are inevitably blamed.
+
+We have been searching for a solution which minimises database changes. Our initial though was to use an XML field to carry the payload of each record, keeping index fields separate for speed. This has the advantage of SQL Server support, but we cannot assume SQL Server. We also have a requirement to export data and we felt that the storage and transfer efficiency of XML was less than optimal.
+
+We therefore decided to store our payloads in JSON format. As we are also considering using MicroLite as our ORM, I investigated (with welcome help from the author) how it might handle JSON data efficiently.
+
+
+
+In everyday interactions, we want to deal with deserialised data. Any JSON conversions should happen 'under the hood'. To that end, we need to define the two endpoints for the data: A typical record with a JSON payload and the classes which will expose it...
+
+using MicroLite.Mapping;
+
+namespace JSON
+{
+    // define the table and a record within it...
+
+    [Table(schema: "dbo", name: "JSONCustomers")]
+    public class Customer
+    {
+        [Identifier(MicroLite.Mapping.IdentifierStrategy.DbGenerated)]
+        [Column("CustomerID")]
+        public int Id { get; set; }
+
+	// The raw JSON payload
+
+        [Column("JSONData")]
+        public CustomerData Data { get; set; }
+
+	// Indexable columns containing copies of fields from within the JSON payload
+        // These support fast querying by anything other than CustomerId
+
+        [Column("GivenName")]
+        public string GivenName { get; set; }
+        [Column("FamilyName")]
+        public string FamilyName { get; set; }
+        [Column("PostCode")]
+        public string PostCode { get; set; }
+    }
+
+    // define the way we would like to interact with the data, once deserialised...
+
+    public class CustomerData
+    {
+        public string GivenName { get; set; }
+        public string FamilyName { get; set; }
+        public DateTime DateOfBirth { get; set; }
+        public Address Address { get; set; }
+    }
+
+    public class Address
+    {
+        public string Line1 { get; set; }
+        public string Line2 { get; set; }
+        public string TownCity { get; set; }
+        public string PostCode { get; set; }
+    }
+}
+
+
+Above, the "JSONData" column (actually a varchar) is defined for MicroLite to be of type CustomerData. To get MicroLite to serialise and deserialise under the hood, we need to define a Type Converter...
+
+using MicroLite.TypeConverters;
+using Newtonsoft.Json;
+
+namespace JSON
+{
+    public class JSONTypeConverter<T> : ITypeConverter
+    {
+        public bool CanConvert(Type propertyType)
+        {
+            return propertyType == typeof(T);
+        }
+
+        public object ConvertFromDbValue(object value, Type propertyType)
+        {
+            if (value == null || value == DBNull.Value)
+            {
+                return null;
+            }
+
+            return JsonConvert.DeserializeObject(value.ToString(), propertyType);
+        }
+
+        public object ConvertFromDbValue(System.Data.IDataReader reader, int index, Type type)
+        {
+            if (reader == null)
+            {
+                return null;
+            }
+
+            var JSONData = reader.GetString(index);
+
+            return JsonConvert.DeserializeObject(JSONData, type);
+        }
+
+        public object ConvertToDbValue(object value, Type propertyType)
+        {
+            if (value == null)
+            {
+                return value;
+            }
+
+            return JsonConvert.SerializeObject(value);
+        }
+    }
+}
+
+Newtonsoft.Json references a popular high-performance JSON framework for .NET - it is open-source (donations welcome !) and available at http://json.codeplex.com/
+
+
+
+Finally, to get MicroLite to maintain the indexable columns, we need to define a Listener to capture the values before we insert or update a record...
+
+using MicroLite.Listeners;
+
+namespace JSON
+{
+    public class CustomerListener : Listener
+    {
+        public override void BeforeInsert(object instance)
+        {
+            var customer = instance as Customer;
+
+            if (customer != null)
+            {
+                this.Project(customer);
+            }
+        }
+
+        public override void BeforeUpdate(object instance)
+        {
+            var customer = instance as Customer;
+
+            if (customer != null)
+            {
+                this.Project(customer);
+            }
+        }
+
+        private void Project(Customer customer)
+        {
+            customer.GivenName = customer.Data.GivenName;
+            customer.FamilyName = customer.Data.FamilyName;
+            customer.PostCode = customer.Data.Address.PostCode;
+        }
+    }
+}
+
+
+
+We can put all this together in a demo...
+
+using MicroLite;
+using MicroLite.Configuration;
+using MicroLite.Builder;
+using MicroLite.TypeConverters;
+using MicroLite.Listeners;
+using JSON;
+
+    class JSONDemo
+    {
+        public static ISessionFactory sessionFactory { get; private set; }
+
+        static void Main(string[] args)
+        {
+            Configure
+                .Extensions()
+                .WithAttributeBasedMapping();
+
+            TypeConverter.Converters.Add(new JSONTypeConverter<CustomerData>());
+
+            Listener.Listeners.Add(new CustomerListener());
+
+            sessionFactory = Configure
+                .Fluently()
+                .ForMsSqlConnection("MicroLiteJSONDemo")
+                .CreateSessionFactory();
+
+            try
+            {
+                Console.WriteLine("OpenSession");
+                using (var session = sessionFactory.OpenSession())
+                {
+
+                    try
+                    {
+                        var customerToInsert = new Customer
+                        {
+                            Data = new CustomerData
+                            {
+                                GivenName = "John",
+                                FamilyName = "Doe",
+                                DateOfBirth = new DateTime(1987, 1, 9),
+                                Address = new Address
+                                {
+                                    Line1 = "1 Oxford Street",
+                                    Line2 = "",
+                                    TownCity = "London",
+                                    PostCode = "WC1 3OX"
+                                }
+                            }
+                        };
+
+                        session.Insert(customerToInsert);
+
+                        Console.WriteLine(customerToInsert.Id);
+
+                        //=======================================================
+
+                        var customerToChange = session.Single<Customer>(customerToInsert.Id);
+
+			// The following has no effect because GivenName is a derived value
+			// which will be updated from Data.GivenName in CustomerListener...
+                        //customerToChange.GivenName += " Henry";
+
+			// Do this instead...
+                        customerToChange.Data.GivenName += " Henry";
+
+                        Console.WriteLine("{0}", customerToChange.Data.GivenName);
+
+                        session.Update(customerToChange);
+
+                        //=======================================================
+
+                        // We can query rapidly on any indexable field
+                        // but we can also query on fields embedded in the JSON payload using a LIKE clause
+
+                        var query = SqlBuilder.Select("CustomerID", "GivenName", "JSONData", "FamilyName")
+                            .From(typeof(Customer))
+                            .Where("CustomerID = @p0", 1)
+                            .OrWhere("GivenName = @p1", "John Henry") // on indexable field
+                            .OrWhere("JSONData LIKE @p2", "%\"DateOfBirth\":\"1987-01-09T00:00:00\"%") // in JSON payload
+                            .OrderByDescending("FamilyName")
+                            .ToSqlQuery();
+
+                        var customers = session.Fetch<Customer>(query);
+                        Console.WriteLine("SqlBuilder.SelectFrom Customers...");
+                        foreach (var customer in customers)
+                        {
+                            Console.WriteLine("{0}\t{1}\t{2}", customer.Id, customer.GivenName, customer.FamilyName);
+                        }
+                        customers = null;
+
+                        //=======================================================
+
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine(e.Message);
+                    }
+                }
+            }
+
+            catch (Exception e)
+            {
+                Console.WriteLine(e.Message);
+            }
+
+            sessionFactory = null;
+
+            Console.ReadKey();
+        }
+    }
+
+
+
+If you just need the raw JSON data (for streaming perhaps), you must define another class that MicroLite will not TypeConvert...
+
+namespace JSON
+{
+    [Table(schema: "dbo", name: "JSONCustomers")]
+    public class CustomerRaw
+    {
+        [Identifier(MicroLite.Mapping.IdentifierStrategy.Assigned)] // Assigned becasue we are only reading
+
+        [Column("JSONData")]
+        public string Data { get; set; }
+    }
+
+and then in class JSONDemo...
+
+                        //=======================================================
+
+                        var queryRaw = SqlBuilder.Select("JSONData")
+                            .From(typeof(CustomerRaw))
+                            .Where("CustomerID = @p0", 1)
+                            .OrWhere("JSONData LIKE @p3", "%\"DateOfBirth\":\"1987-01-09T00:00:00\"%") // in JSON payload
+                            .ToSqlQuery();
+
+                        var customersRaw = session.Fetch<CustomerRaw>(queryRaw);
+                        Console.WriteLine("SqlBuilder.SelectFrom CustomersRaw...");
+                        foreach (var customerRaw in customersRaw)
+                        {
+                            Console.WriteLine("Raw Data: {0}", customerRaw.Data);
+                        }
+                        customersRaw = null;
+
+                        //=======================================================
+
